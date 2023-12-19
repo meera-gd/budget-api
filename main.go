@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -9,9 +10,16 @@ import (
 	"os"
 	"strings"
 
+	"firebase.google.com/go"
+	"firebase.google.com/go/auth"
+
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
+
+	"google.golang.org/api/option"
 )
+
+var firebaseAuthClient *auth.Client
 
 func main() {
 	err := godotenv.Load()
@@ -19,16 +27,48 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
+	firebaseOpt := option.WithCredentialsFile(os.Getenv("FIREBASE_KEY_FILE"))
+	firebaseApp, err := firebase.NewApp(context.Background(), nil, firebaseOpt)
+	if err != nil {
+		log.Fatalf("Error initializing Firebase app: %v", err)
+	}
+
+	firebaseAuthClient, err = firebaseApp.Auth(context.Background())
+	if err != nil {
+		log.Fatalf("Error initializing Firebase auth: %v", err)
+	}
+
 	router := mux.NewRouter()
-	router.HandleFunc("/api/hello/{username}", GreetingHandler).Methods(http.MethodGet)
-	router.PathPrefix("/api").HandlerFunc(NotFoundHandler)
-	router.PathPrefix("/").Handler(FrontendHandler()).Methods(http.MethodGet)
+	apiRouter := router.PathPrefix("/api").Subrouter()
+	apiRouter.Use(authMiddleware)
+
+	apiRouter.HandleFunc("/hello/{username}", greetingHandler).Methods(http.MethodGet)
+	apiRouter.PathPrefix("/").HandlerFunc(notFoundHandler)
+
+	router.PathPrefix("/").Handler(frontendHandler()).Methods(http.MethodGet)
 
 	port := os.Getenv("PORT")
 	http.ListenAndServe(":"+port, router)
 }
 
-func FrontendHandler() http.Handler {
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenStr, authHeaderHasBearerFormat := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !authHeaderHasBearerFormat || len(tokenStr) == 0 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		token, err := firebaseAuthClient.VerifyIDToken(r.Context(), tokenStr)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), "uid", token.UID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func frontendHandler() http.Handler {
 	fileServer := os.Getenv("FILE_SERVER")
 	target, err := url.Parse(fileServer)
 	if err != nil {
@@ -47,7 +87,8 @@ func FrontendHandler() http.Handler {
 	}
 }
 
-func GreetingHandler(w http.ResponseWriter, r *http.Request) {
+func greetingHandler(w http.ResponseWriter, r *http.Request) {
+	//uid, ok := r.Context().Value("uid").(string)
 	username := mux.Vars(r)["username"]
 	data := map[string]string{
 		"message": "Hello, " + username + "!",
@@ -55,7 +96,7 @@ func GreetingHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, data, http.StatusOK)
 }
 
-func NotFoundHandler(w http.ResponseWriter, r *http.Request) {
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotFound)
 }
 
